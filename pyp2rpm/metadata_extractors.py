@@ -4,30 +4,38 @@ import sys
 import re
 import tempfile
 import shutil
-import itertools
 import glob
 import textwrap
+import runpy
 from abc import ABCMeta, abstractmethod
-try:
-    import xmlrpclib
-except ImportError:
-    import xmlrpc.client as xmlrpclib
 
+from command import extract_dist
 from pyp2rpm import archive
 from pyp2rpm.dependency_parser import deps_from_pyp_format, deps_from_pydit_json
 from pyp2rpm.exceptions import VirtualenvFailException
 from pyp2rpm.package_data import PackageData
 from pyp2rpm.package_getters import get_url
-from pyp2rpm.logger import LoggerWriter
 from pyp2rpm import settings
 from pyp2rpm import utils
-from pyp2rpm import extract_distribution
 try:
     from pyp2rpm import virtualenv
 except ImportError:
     virtualenv = None
 
 logger = logging.getLogger(__name__)
+
+
+def current_interpreter_run(setup_py, *args):
+    """Runs given setup.py script using current python interpreter."""
+    dirname = os.path.dirname(setup_py)
+    filename = os.path.basename(setup_py)
+    if filename.endswith('py'):
+        filename = filename[:-3]
+
+    with utils.ChangeDir(dirname):
+        sys.path.insert(0, dirname)
+        sys.argv[1:] = args
+        runpy.run_module(filename, run_name='__main__', alter_sys=True)
 
 
 def pypi_metadata_extension(extraction_fce):
@@ -108,6 +116,46 @@ class LocalMetadataExtractor(object):
         return deps_list
 
     @property
+    @abstractmethod
+    def runtime_deps(self):
+        pass
+
+    @property
+    @abstractmethod
+    def build_deps(self):
+        pass
+
+    @property
+    @abstractmethod
+    def py_modules(self):
+        pass
+
+    @property
+    @abstractmethod
+    def scripts(self):
+        pass
+
+    @property
+    @abstractmethod
+    def home_page(self):
+        pass
+
+    @property
+    @abstractmethod
+    def description(self):
+        pass
+
+    @property
+    @abstractmethod
+    def summary(self):
+        pass
+
+    @property
+    @abstractmethod
+    def license(self):
+        pass
+
+    @property
     def has_pth(self):
         """Figure out if package has pth file """
         return "." in self.name
@@ -119,6 +167,21 @@ class LocalMetadataExtractor(object):
             True if the package has a binary extension, False otherwise
         """
         return self.archive.has_file_with_suffix(settings.EXTENSION_SUFFIXES)
+
+    @property
+    @abstractmethod
+    def has_test_suite(self):
+        pass
+
+    @property
+    @abstractmethod
+    def versions_from_archive(self):
+        pass
+
+    @property
+    @abstractmethod
+    def doc_files(self):
+        pass
 
     @property
     def data_from_venv(self):
@@ -163,7 +226,7 @@ class LocalMetadataExtractor(object):
             setattr(data, "scripts", utils.remove_major_minor_suffix(data.data['scripts']))
         # for example nose has attribute `packages` but instead of name listing the pacakges
         # is using function to find them, that makes data.packages an empty set
-        if data.has_packages and data.packages in ("TODO:", set()):
+        if data.packages in ("TODO:", set()):
             data.packages = set([data.name])
 
         return data
@@ -177,17 +240,66 @@ class LocalMetadataExtractor(object):
         return other, licenses
 
     @property
-    @abstractmethod
     def data_from_archive(self):
-        pass
+        """Returns all metadata extractable from the archive.
+        Returns:
+            dictionary containing metadata extracted from the archive
+        """
+        archive_data = {}
+
+        archive_data['runtime_deps'] = self.runtime_deps
+        archive_data['build_deps'] = [['BuildRequires', 'python2-devel']] + self.build_deps
+
+        archive_data['py_modules'] = self.py_modules
+        archive_data['scripts'] = self.scripts
+
+        archive_data['home_page'] = self.home_page
+        archive_data['description'] = self.description
+        archive_data['summary'] = self.summary
+
+        archive_data['license'] = self.license
+        archive_data['has_pth'] = self.has_pth
+        archive_data['has_extension'] = self.has_extension
+        archive_data['has_test_suite'] = self.has_test_suite
+
+        py_vers = self.versions_from_archive
+        archive_data['base_python_version'] = py_vers[0] if py_vers \
+            else settings.DEFAULT_PYTHON_VERSION
+        archive_data['python_versions'] = py_vers[1:] if py_vers \
+            else [settings.DEFAULT_ADDITIONAL_VERSION]
+
+        (archive_data['doc_files'],
+         archive_data['doc_license']) = self.separate_license_files(self.doc_files)
+
+        return archive_data
 
 
 class SetupPyMetadataExtractor(LocalMetadataExtractor):
-    """Class to extract metadata from setup.py"""
+    """Class to extract metadata from setup.py using custom extract_dist command."""
+
+    def __init__(self, *args, **kwargs):
+        super(SetupPyMetadataExtractor, self).__init__(*args, **kwargs)
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            with self.archive as a:
+                a.extract_all(directory=temp_dir)
+                try:
+                    setup_py = glob.glob(temp_dir + "/{0}*/".format(self.name) + 'setup.py')[0]
+                except IndexError:
+                    sys.stderr.write(
+                        "setup.py not found, maybe local_file is not proper source archive.\n")
+                    raise SystemExit(3)
+                current_interpreter_run(setup_py, '--quiet', '--command-packages', 'command',
+                                        'extract_dist')
+
+                self.distribution = extract_dist.extract_dist.class_dist
+        finally:
+            shutil.rmtree(temp_dir)
 
     @property
-    def runtime_deps_from_setup_py(self):  # install_requires
-        """ Returns list of runtime dependencies of the package specified in setup.py.
+    def runtime_deps(self):  # install_requires
+        """Returns list of runtime dependencies of the package specified in setup.py.
 
         Dependencies are in RPM SPECFILE format - see dependency_to_rpm() for details,
         but names are already
@@ -196,43 +308,91 @@ class SetupPyMetadataExtractor(LocalMetadataExtractor):
         Returns:
             list of runtime dependencies of the package
         """
-        install_requires = self.archive.find_list_argument('install_requires')
-        if self.archive.has_argument('entry_points') and 'setuptools' not in install_requires:
+        install_requires = self.distribution.install_requires
+        if self.distribution.entry_points and 'setuptools' not in install_requires:
             install_requires.append('setuptools')  # entrypoints
 
         return self.name_convert_deps_list(deps_from_pyp_format(install_requires, runtime=True))
 
     @property
-    def build_deps_from_setup_py(self):  # setup_requires
-        """Same as runtime_deps_from_setup_py, but build dependencies.
+    def build_deps(self):  # setup_requires + tests_require
+        """Same as runtime_deps, but build dependencies. Test requires
+        are included only if package contains test suite.
 
         Returns:
             list of build dependencies of the package
         """
-        build_requires = self.archive.find_list_argument('setup_requires')
-        if 'setuptools' in build_requires:
-            build_requires.remove('setuptools')
-
-        build = self.name_convert_deps_list(
-            deps_from_pyp_format(build_requires, runtime=False))
-        test = self.name_convert_deps_list(
-            deps_from_pyp_format(self.archive.find_list_argument('tests_require'), runtime=False))
-
-        return list(build + test)
+        build_requires = self.distribution.setup_requires
+        if self.has_test_suite:
+            build_requires += self.distribution.tests_require
+        if 'setuptools' not in build_requires:
+            build_requires.append('setuptools')
+        return self.name_convert_deps_list(deps_from_pyp_format(
+            build_requires, runtime=False))
 
     @property
-    def runtime_deps_from_egg_info(self):
-        """ Returns list of runtime dependencies of the package specified in EGG-INFO/requires.txt.
+    def has_packages(self):
+        return self.distribution.packages != set()
 
-        Dependencies are in RPM SPECFILE format - see dependency_to_rpm() for details,
-        but names are already transformed according to current distro.
+    @property
+    def packages(self):
+        if self.has_packages:
+            packages = [package.split('.', 1)[0]
+                        for package in self.distribution.packages]
+            return set(packages)
 
-        Returns:
-            list of runtime dependencies of the package
-        """
-        requires_txt = self.archive.get_content_of_file(
-            'EGG-INFO/requires.txt', True) or ''
-        return self.name_convert_deps_list(deps_from_pyp_format(requires_txt.splitlines()))
+    @property
+    def py_modules(self):
+        return set(self.distribution.py_modules)
+
+    @property
+    def scripts(self):
+        if not self.distribution.entry_points:
+            return set()
+        scripts = self.distribution.entry_points.get('console_scripts', [])
+        # handle the case for 'console_scripts' = [ 'a = b' ]
+        transformed = []
+        for script in scripts:
+            equal_sign = script.find('=')
+            if equal_sign == -1:
+                transformed.append(script)
+            else:
+                transformed.append(script[0:equal_sign].strip())
+        return set([os.path.basename(t) for t in transformed])
+
+    @property
+    def home_page(self):
+        return self.distribution.url
+
+    @property
+    @process_description
+    def long_description(self):
+        return self.distribution.long_description
+
+    @property
+    def description(self):
+        """Shorten description on first newline after approx 10 lines"""
+        cut = self.long_description.find('\n', 80 * 8)
+        if cut > -1:
+            return self.long_description[:cut] + '\n...'
+        else:
+            return self.long_description
+
+    @property
+    def summary(self):
+        return self.distribution.description
+
+    @property
+    def classifiers(self):
+        return self.distribution.classifiers
+
+    @property
+    def license(self):
+        return self.distribution.license
+
+    @property
+    def versions_from_archive(self):
+        return utils.versions_from_trove(self.distribution.classifiers)
 
     @property
     def has_bundled_egg_info(self):
@@ -248,7 +408,7 @@ class SetupPyMetadataExtractor(LocalMetadataExtractor):
         Returns:
             True if the package contains setup.py test suite, False otherwise
         """
-        return self.archive.has_argument('test_suite')
+        return self.distribution.test_suite is not None
 
     @property
     def doc_files(self):
@@ -283,215 +443,19 @@ class SetupPyMetadataExtractor(LocalMetadataExtractor):
         return sphinx_dir
 
     @property
-    def license_from_archive(self):
-        if self.local_file.endswith('.egg'):
-            return self.license_from_egg_info
-        else:
-            return self.license_from_setup_py
-
-    @property
-    def license_from_setup_py(self):
-        return utils.license_from_trove(self.archive.find_list_argument('classifiers'))
-
-    @property
-    def license_from_egg_info(self):
-        return utils.license_from_trove(self.archive.get_content_of_file(
-            'EGG-INFO/PKG-INFO', True).splitlines())
-
-    @property
-    def versions_from_archive(self):
-        if self.local_file.endswith('.egg'):
-            trove = self.archive.get_content_of_file('EGG-INFO/PKG-INFO', True).splitlines()
-        else:
-            trove = self.archive.find_list_argument('classifiers')
-        return utils.versions_from_trove(trove)
-
-    @property
-    def has_packages(self):
-        return self.archive.has_argument('packages')
-
-    @property
-    def packages(self):
-        # added because of Issue #8
-        # https://bitbucket.org/bkabrda/pyp2rpm/issue/8/packaging-beets
-        if self.has_packages:
-            # usually packages list looks like `foo.bar.baz` but we are interested
-            # only in `foo`
-            packages = [package.split('.', 1)[0]
-                        for package in self.archive.find_list_argument('packages')]
-            return set(packages)
-
-    @property
-    def has_py_modules(self):
-        return self.archive.has_argument('py_modules')
-
-    @property
-    def py_modules(self):
-        return self.archive.find_list_argument('py_modules')
-
-    @property
-    def scripts(self):
-        scripts = self.archive.find_list_argument('scripts')
-        # handle the case for 'console_scripts' = [ 'a = b' ]
-        transformed = []
-        for script in scripts:
-            equal_sign = script.find('=')
-            if equal_sign == -1:
-                transformed.append(script)
-            else:
-                transformed.append(script[0:equal_sign].strip())
-
-        return list(map(os.path.basename, transformed))
-
-    @property
     def data_from_archive(self):
-        """Returns all metadata extractable from the archive.
-        Returns:
-            dictionary containing metadata extracted from the archive
-        """
-        archive_data = {}
+        """Appends setup.py specific metadata to archive_data."""
 
-        archive_data['license'] = self.license_from_archive
-        archive_data['has_pth'] = self.has_pth
-        archive_data['scripts'] = self.scripts
-        archive_data['has_extension'] = self.has_extension
+        archive_data = super(SetupPyMetadataExtractor, self).data_from_archive
 
-        if self.archive.is_egg:
-            archive_data['runtime_deps'] = self.runtime_deps_from_egg_info
-            archive_data['build_deps'] = [['BuildRequires', 'python2-devel'],
-                                          ['BuildRequires', 'python-setuptools']]
-        else:
-            archive_data['runtime_deps'] = self.runtime_deps_from_setup_py
-            archive_data['build_deps'] = utils.unique_deps([['BuildRequires', 'python2-devel'],
-                                                            ['BuildRequires', 'python-setuptools']]
-                                                           + self.build_deps_from_setup_py)
-
-        py_vers = self.versions_from_archive
-        archive_data['base_python_version'] = py_vers[0] if py_vers \
-            else settings.DEFAULT_PYTHON_VERSION
-        archive_data['python_versions'] = py_vers[1:] if py_vers \
-            else [settings.DEFAULT_ADDITIONAL_VERSION]
-
-        (archive_data['doc_files'],
-         archive_data['doc_license']) = self.separate_license_files(self.doc_files)
-        archive_data['py_modules'] = self.py_modules
-        archive_data['has_test_suite'] = self.has_test_suite
-        archive_data['has_bundled_egg_info'] = self.has_bundled_egg_info
         archive_data['has_packages'] = self.has_packages
         archive_data['packages'] = self.packages
-
+        archive_data['has_bundled_egg_info'] = self.has_bundled_egg_info
         sphinx_dir = self.sphinx_dir
         if sphinx_dir:
             archive_data['sphinx_dir'] = "/".join(sphinx_dir.split("/")[1:])
             archive_data['build_deps'].append(
                 ['BuildRequires', 'python-sphinx'])
-
-        return archive_data
-
-
-class DistMetadataExtractor(SetupPyMetadataExtractor):
-    """Metadata extractor based on bdist_rpm distutils command"""
-
-    def __init__(self, *args, **kwargs):
-        super(DistMetadataExtractor, self).__init__(*args, **kwargs)
-
-        temp_dir = tempfile.mkdtemp()
-        try:
-            with self.archive as a:
-                a.extract_all(directory=temp_dir)
-                try:
-                    setup_py = glob.glob(temp_dir + "/{0}*/".format(self.name) + 'setup.py')[0]
-                except IndexError:
-                    sys.stderr.write(
-                        "setup.py not found, maybe local_file is not proper source archive.\n")
-                    raise SystemExit(3)
-
-                with utils.ChangeDir(os.path.dirname(setup_py)):
-                    with utils.RedirectStdStreams(stdout=LoggerWriter(logger.debug),
-                                                  stderr=LoggerWriter(logger.warning)):
-                        extract_distribution.run_setup(setup_py, 'bdist_rpm')
-
-                self.distribution = extract_distribution.extract_distribution.class_distribution
-        finally:
-            shutil.rmtree(temp_dir)
-
-    @property
-    def license_from_archive(self):
-        return self.distribution.get_license()
-
-    @property
-    def runtime_deps_from_setup_py(self):
-        return self.name_convert_deps_list(deps_from_pyp_format(self.distribution.run_requires))
-
-    @property
-    def build_deps_from_setup_py(self):
-        return self.name_convert_deps_list(deps_from_pyp_format(self.distribution.build_requires,
-                                                                runtime=False))
-
-    @property
-    def conflicts(self):
-        return self.name_convert_deps_list(self.distribution.conflicts)
-
-    @property
-    def versions_from_archive(self):
-        return utils.versions_from_trove(self.distribution.metadata.classifiers)
-
-    @property
-    @process_description
-    def long_description(self):
-        if not self.distribution.metadata.long_description:
-            return 'TODO'
-        else:
-            return self.distribution.metadata.long_description
-
-    @property
-    def description(self):
-        """Shorten description on first newline after approx 10 lines"""
-        cut = self.long_description.find('\n', 80 * 8)
-        if cut > -1:
-            return self.long_description[:cut] + '\n...'
-        else:
-            return self.long_description
-
-    @property
-    def py_modules(self):
-        return self.distribution.py_modules
-
-    @property
-    def has_packages(self):
-        return self.distribution.packages is not None
-
-    @property
-    def packages(self):
-        if self.has_packages:
-            packages = [package.split('.', 1)[0]
-                        for package in self.distribution.packages]
-            return set(packages)
-
-    @property
-    def data_from_archive(self):
-        """Returns all metadata extractable from distutils distribution object
-        Returns:
-            dictionary containing extracted metadata
-        """
-        archive_data = super(DistMetadataExtractor, self).data_from_archive
-
-        if not self.distribution.force_arch:
-            if not self.distribution.has_ext_modules():
-                archive_data['build_arch'] = 'noarch'
-        else:
-            archive_data['build_arch'] = self.distribution.force_arch
-
-        archive_data['description'] = self.description
-        archive_data['summary'] = self.distribution.get_description()
-        archive_data['home_page'] = self.distribution.get_url()
-        archive_data['icon'] = getattr(self.distribution, 'icon', None)
-
-        archive_data['prep_cmd'] = getattr(self.distribution, 'prep', settings.DEFAULT_PREP)
-        archive_data['build_cmd'] = getattr(self.distribution, 'build', settings.DEFAULT_BUILD)
-        archive_data['install_cmd'] = getattr(
-            self.distribution, 'install', settings.DEFAULT_INSTALL)
-        archive_data['clean_cmd'] = getattr(self.distribution, 'clean', settings.DEFAULT_CLEAN)
 
         return archive_data
 
@@ -504,20 +468,6 @@ class WheelMetadataExtractor(LocalMetadataExtractor):
         if not hasattr(self, '_json_metadata'):
             self._json_metadata = self.archive.json_wheel_metadata
         return self._json_metadata
-
-    @property
-    def doc_files(self):
-        return set([doc for doc in self.json_metadata.get('extensions', {})
-                                                     .get('python.details', {})
-                                                     .get('document_names', {}).values()])
-
-    @property
-    def home_page(self):
-        urls = [url for url in self.json_metadata.get('extensions', {})
-                                                 .get('python.details', {})
-                                                 .get('project_urls', {}).values()]
-        if urls:
-            return urls[0]
 
     def get_requires(self, requires_types):
         "Extracts requires of given types from metadata file, filter windows specific requires"
@@ -533,25 +483,21 @@ class WheelMetadataExtractor(LocalMetadataExtractor):
         return extracted_requires
 
     @property
-    def license(self):
-        return self.json_metadata.get('license', None)
-
-    @property
-    def summary(self):
-        return self.json_metadata.get('summary', None)
-
-    @property
     def runtime_deps(self):
         run_requires = self.get_requires(['run_requires', 'meta_requires'])
+        if 'setuptools' not in run_requires:
+            run_requires.append('setuptools')
         return self.name_convert_deps_list(deps_from_pydit_json(run_requires))
 
     @property
     def build_deps(self):
         build_requires = self.get_requires(['build_requires', 'test_requires'])
+        if 'setuptools' not in build_requires:
+            build_requires.append('setuptools')
         return self.name_convert_deps_list(deps_from_pydit_json(build_requires, runtime=False))
 
     @property
-    def modules(self):
+    def py_modules(self):
         return self.archive.record.get('modules')
 
     @property
@@ -559,16 +505,12 @@ class WheelMetadataExtractor(LocalMetadataExtractor):
         return self.archive.record.get('scripts', [])
 
     @property
-    def has_test_suite(self):
-        return self.json_metadata.get('test_requires', False) is not False
-
-    @property
-    def classifiers(self):
-        return self.json_metadata.get('classifiers', [])
-
-    @property
-    def versions_from_archive(self):
-        return utils.versions_from_trove(self.classifiers)
+    def home_page(self):
+        urls = [url for url in self.json_metadata.get('extensions', {})
+                                                 .get('python.details', {})
+                                                 .get('project_urls', {}).values()]
+        if urls:
+            return urls[0]
 
     @property
     @process_description
@@ -576,32 +518,27 @@ class WheelMetadataExtractor(LocalMetadataExtractor):
         return self.archive.wheel_description()
 
     @property
-    def data_from_archive(self):
-        """Returns all metadata extractable from the whl pydist.json
-        Returns:
-            dictionary containing metadata extracted from json data
-        """
-        archive_data = {}
-        archive_data['license'] = self.license
-        archive_data['summary'] = self.summary
-        archive_data['home_page'] = self.home_page
-        (archive_data['doc_files'],
-         archive_data['doc_license']) = self.separate_license_files(self.doc_files)
-        archive_data['has_pth'] = self.has_pth
-        archive_data['runtime_deps'] = utils.unique_deps(self.runtime_deps)
-        archive_data['build_deps'] = utils.unique_deps([['BuildRequires', 'python2-devel'],
-                                                        ['BuildRequires', 'python-setuptools']]
-                                                       + self.build_deps)
-        archive_data['py_modules'] = self.modules
-        archive_data['scripts'] = self.scripts
-        archive_data['has_test_suite'] = self.has_test_suite
-        archive_data['has_extension'] = self.has_extension
+    def summary(self):
+        return self.json_metadata.get('summary', None)
 
-        py_vers = self.versions_from_archive
-        archive_data['base_python_version'] = py_vers[0] if py_vers \
-            else settings.DEFAULT_PYTHON_VERSION
-        archive_data['python_versions'] = py_vers[1:] if py_vers \
-            else [settings.DEFAULT_ADDITIONAL_VERSION]
+    @property
+    def classifiers(self):
+        return self.json_metadata.get('classifiers', [])
 
-        archive_data['description'] = self.description
-        return archive_data
+    @property
+    def license(self):
+        return self.json_metadata.get('license', None)
+
+    @property
+    def versions_from_archive(self):
+        return utils.versions_from_trove(self.classifiers)
+
+    @property
+    def has_test_suite(self):
+        return self.json_metadata.get('test_requires', False) is not False
+
+    @property
+    def doc_files(self):
+        return set([doc for doc in self.json_metadata.get('extensions', {})
+                                                     .get('python.details', {})
+                                                     .get('document_names', {}).values()])
