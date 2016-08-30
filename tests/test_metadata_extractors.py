@@ -289,6 +289,7 @@ class TestWheelMetadataExtractor(object):
                 ('py2exe-0.9.2.2-py33.py34-none-any.whl', 'py2exe', '0.9.2.2')]:
             self.e.append(me.WheelMetadataExtractor('{0}{1}'.format(
                 self.td_dir, archive), name, self.nc, version))
+            self.e[-1].venv = None
 
     @pytest.mark.parametrize(('i', 'what', 'expected'), [
         (0, 'runtime_deps', [['Requires', 'python-certifi', '==', '2015.11.20'],
@@ -330,6 +331,5 @@ class TestWheelMetadataExtractor(object):
 
     ])
     def test_extract(self, i, what, expected):
-        flexmock(me.WheelMetadataExtractor).should_receive('data_from_venv').and_return({})
         data = self.e[i].extract_data()
         assert getattr(data, what) == expected

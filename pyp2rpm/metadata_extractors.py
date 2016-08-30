@@ -39,9 +39,7 @@ def current_interpreter_run(setup_py, *args):
 
 
 def pypi_metadata_extension(extraction_fce):
-    """Extracts data from PyPI and appends them to data returned from
-    given data extraction method.
-    """
+    """Extracts data from PyPI and merges them with data from extraction method."""
 
     def inner(self, client=None):
         data = extraction_fce(self)
@@ -63,6 +61,31 @@ def pypi_metadata_extension(extraction_fce):
         # we usually get better license representation from trove classifiers
         data_dict["license"] = utils.license_from_trove(release_data.get('classifiers', ''))
         data.set_from(data_dict, update=True)
+        return data
+    return inner
+
+
+def venv_metadata_extension(extraction_fce):
+    """Extracts specific metadata from virtualenv object, merges them with data
+    from given extraction method.
+    """
+
+    def inner(self):
+        data = extraction_fce(self)
+        if virtualenv is None or not self.venv:
+            logger.debug("Skipping virtualenv metadata extraction.")
+            return data
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            extractor = virtualenv.VirtualEnv(self.name, temp_dir,
+                                              self.name_convertor,
+                                              self.base_python_version)
+            data.set_from(extractor.get_venv_data, update=True)
+        except VirtualenvFailException as e:
+            logger.error("{}, skipping virtualenv metadata extraction.".format(e))
+        finally:
+            shutil.rmtree(temp_dir)
         return data
     return inner
 
@@ -183,28 +206,8 @@ class LocalMetadataExtractor(object):
     def doc_files(self):
         pass
 
-    @property
-    def data_from_venv(self):
-        """Returns all metadata extractable from virtualenv object.
-        Returns:
-            dictionary containing metadata extracted from virtualenv
-        """
-        if not self.venv:
-            return {}
-
-        temp_dir = tempfile.mkdtemp()
-        try:
-            extractor = virtualenv.VirtualEnv(self.name, temp_dir,
-                                              self.name_convertor,
-                                              self.base_python_version)
-            return extractor.get_venv_data
-        except VirtualenvFailException as e:
-            logger.error("{}, skipping virtualenv metadata extraction".format(e))
-            return {}
-        finally:
-            shutil.rmtree(temp_dir)
-
     @pypi_metadata_extension
+    @venv_metadata_extension
     def extract_data(self):
         """Extracts data from archive.
         Returns:
@@ -218,9 +221,6 @@ class LocalMetadataExtractor(object):
 
         with self.archive:
             data.set_from(self.data_from_archive)
-
-        if virtualenv is not None:
-            data.set_from(self.data_from_venv, update=True)
 
         if "scripts" in data.data:
             setattr(data, "scripts", utils.remove_major_minor_suffix(data.data['scripts']))
