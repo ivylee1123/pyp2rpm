@@ -322,9 +322,7 @@ class SetupPyMetadataExtractor(LocalMetadataExtractor):
         Returns:
             list of build dependencies of the package
         """
-        build_requires = self.distribution.setup_requires
-        if self.has_test_suite:
-            build_requires += self.distribution.tests_require
+        build_requires = self.distribution.setup_requires + self.distribution.tests_require
         if 'setuptools' not in build_requires:
             build_requires.append('setuptools')
         return self.name_convert_deps_list(deps_from_pyp_format(
@@ -347,18 +345,18 @@ class SetupPyMetadataExtractor(LocalMetadataExtractor):
 
     @property
     def scripts(self):
-        if not self.distribution.entry_points:
-            return set()
-        scripts = self.distribution.entry_points.get('console_scripts', [])
-        # handle the case for 'console_scripts' = [ 'a = b' ]
+        direct = self.distribution.scripts or []
         transformed = []
-        for script in scripts:
-            equal_sign = script.find('=')
-            if equal_sign == -1:
-                transformed.append(script)
-            else:
-                transformed.append(script[0:equal_sign].strip())
-        return set([os.path.basename(t) for t in transformed])
+        if self.distribution.entry_points:
+            scripts = self.distribution.entry_points.get('console_scripts', [])
+            # handle the case for 'console_scripts' = [ 'a = b' ]
+            for script in scripts:
+                equal_sign = script.find('=')
+                if equal_sign == -1:
+                    transformed.append(script)
+                else:
+                    transformed.append(script[0:equal_sign].strip())
+        return set([os.path.basename(t) for t in transformed + direct])
 
     @property
     def home_page(self):
@@ -408,7 +406,7 @@ class SetupPyMetadataExtractor(LocalMetadataExtractor):
         Returns:
             True if the package contains setup.py test suite, False otherwise
         """
-        return self.distribution.test_suite is not None
+        return self.distribution.test_suite is not None or self.distribution.tests_require != []
 
     @property
     def doc_files(self):
