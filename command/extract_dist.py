@@ -1,3 +1,5 @@
+import sys
+import pickle
 from distutils.core import Command
 
 
@@ -39,6 +41,9 @@ class extract_dist(Command):
         """Assignment of distribution attribute to class_dist."""
         extract_dist.class_dist = self.distribution
 
+    def run_subprocess(self):
+        data = pickle.dumps(self.distribution)
+        sys.stdout.buffer.write(data)
 
 def to_list(var):
     """Checks if given value is a list, tries to convert, if it is not."""

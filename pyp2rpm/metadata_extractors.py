@@ -7,6 +7,8 @@ import shutil
 import glob
 import textwrap
 import runpy
+import pickle
+from subprocess import Popen, PIPE 
 from abc import ABCMeta, abstractmethod
 
 from command import extract_dist
@@ -17,6 +19,7 @@ from pyp2rpm.package_data import PackageData
 from pyp2rpm.package_getters import get_url
 from pyp2rpm import settings
 from pyp2rpm import utils
+from pyp2rpm import main_dir
 try:
     from pyp2rpm import virtualenv
 except ImportError:
@@ -24,18 +27,42 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+class ModuleRunner(object):
+    """Runs given module in current interpreter using runpy."""
 
-def current_interpreter_run(setup_py, *args):
-    """Runs given setup.py script using current python interpreter."""
-    dirname = os.path.dirname(setup_py)
-    filename = os.path.basename(setup_py)
-    if filename.endswith('py'):
-        filename = filename[:-3]
+    def __init__(self, module, *args):
+        self.dirname = os.path.dirname(module)
+        self.filename = os.path.basename(module)
+        self.args = args
 
-    with utils.ChangeDir(dirname):
-        sys.path.insert(0, dirname)
-        sys.argv[1:] = args
-        runpy.run_module(filename, run_name='__main__', alter_sys=True)
+    @staticmethod
+    def not_suffixed(module):
+        if module.endswith('py'):
+            return module[:-3]
+
+    def run(self):
+        with utils.ChangeDir(self.dirname):
+            sys.path.insert(0, self.dirname)
+            sys.argv[1:] = self.args
+            runpy.run_module(self.not_suffixed(self.filename), run_name='__main__', alter_sys=True)
+
+    def get_result(self):
+        return extract_dist.extract_dist.class_dist
+
+
+class ExternModuleRunner(ModuleRunner):
+    """Runs module in extern interpreter using subprocess."""
+
+    def run(self):
+        with utils.ChangeDir(self.dirname):
+
+            command_list = ['PYTHONPATH=' + main_dir, 'python', self.filename] + list(self.args)
+            proc = Popen(' '.join(command_list), stdout=PIPE, stderr=PIPE, shell=True)
+            stream_data = proc.communicate()
+            self._result = pickle.loads(stream_data[0])
+
+    def get_result(self):
+        return self._result
 
 
 def pypi_metadata_extension(extraction_fce):
@@ -288,10 +315,9 @@ class SetupPyMetadataExtractor(LocalMetadataExtractor):
                     sys.stderr.write(
                         "setup.py not found, maybe local_file is not proper source archive.\n")
                     raise SystemExit(3)
-                current_interpreter_run(setup_py, '--quiet', '--command-packages', 'command',
-                                        'extract_dist')
-
-                self.distribution = extract_dist.extract_dist.class_dist
+                runner = ModuleRunner(setup_py, '--quiet', '--command-packages', 'command', 'extract_dist')
+                runner.run()
+                self.distribution = runner.get_result()
         finally:
             shutil.rmtree(temp_dir)
 

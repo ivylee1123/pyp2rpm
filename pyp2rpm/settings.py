@@ -17,6 +17,7 @@ SPHINX_DIR_RE = r'[^/]+/doc.?'
 PYPI_URL = 'https://pypi.python.org/pypi'
 PYPI_USABLE_DATA = ['description', 'summary', 'license', 'home_page', 'requires']
 CONSOLE_LOGGING = False
+PY2INTERPRETER='/usr/bin/python2'
 
 TROVE_LICENSES = {'License :: OSI Approved :: Academic Free License (AFL)': 'AFL',
                   'License :: OSI Approved :: Apache Software License': 'ASL %(TODO: version)s',
