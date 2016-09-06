@@ -1,20 +1,20 @@
 import logging
 import os
 import sys
+import json
 import re
 import tempfile
 import shutil
 import glob
 import textwrap
-import runpy
-from abc import ABCMeta, abstractmethod
+from abc import ABCMeta
 
-from command import extract_dist
 from pyp2rpm import archive
 from pyp2rpm.dependency_parser import deps_from_pyp_format, deps_from_pydit_json
 from pyp2rpm.exceptions import VirtualenvFailException
 from pyp2rpm.package_data import PackageData
 from pyp2rpm.package_getters import get_url
+from pyp2rpm.module_runners import ModuleRunner, ExternModuleRunner
 from pyp2rpm import settings
 from pyp2rpm import utils
 try:
@@ -23,19 +23,6 @@ except ImportError:
     virtualenv = None
 
 logger = logging.getLogger(__name__)
-
-
-def current_interpreter_run(setup_py, *args):
-    """Runs given setup.py script using current python interpreter."""
-    dirname = os.path.dirname(setup_py)
-    filename = os.path.basename(setup_py)
-    if filename.endswith('py'):
-        filename = filename[:-3]
-
-    with utils.ChangeDir(dirname):
-        sys.path.insert(0, dirname)
-        sys.argv[1:] = args
-        runpy.run_module(filename, run_name='__main__', alter_sys=True)
 
 
 def pypi_metadata_extension(extraction_fce):
@@ -231,14 +218,25 @@ class SetupPyMetadataExtractor(LocalMetadataExtractor):
                 a.extract_all(directory=temp_dir)
                 try:
                     setup_py = glob.glob(temp_dir + "/{0}*/".format(self.name) + 'setup.py')[0]
+                    runner = ModuleRunner(setup_py, *settings.EXTRACT_DIST_COMMAND_ARGS)
+                    logger.info("Running extract_dist command using runpy.")
+                    runner.run()
                 except IndexError:
                     sys.stderr.write(
                         "setup.py not found, maybe local_file is not proper source archive.\n")
                     raise SystemExit(3)
-                current_interpreter_run(setup_py, '--quiet', '--command-packages', 'command',
-                                        'extract_dist')
-
-                self.metadata = extract_dist.extract_dist.class_metadata
+                except (SyntaxError, RuntimeError):
+                    try:
+                        if sys.version_info[0] == 2:
+                            raise SyntaxError
+                        logger.error("Error occured, trying external python2 interpreter.")
+                        runner = ExternModuleRunner(setup_py,
+                                                    *settings.EXTRACT_DIST_COMMAND_ARGS + ['--stdout'])
+                        runner.run()
+                    except (json.decoder.JSONDecodeError, SyntaxError):
+                        sys.stdout.write("Failed to extract data from setup.py script.\n")
+                        raise SystemExit(3)
+                self.metadata = runner.results
         finally:
             shutil.rmtree(temp_dir)
 
